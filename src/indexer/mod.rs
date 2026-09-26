@@ -16139,6 +16139,9 @@ fn run_index_inner(
     local_connector_roots: LocalConnectorRootsOverride,
     mirror_source_ids: Option<Vec<String>>,
 ) -> Result<()> {
+    // An index pass inside a `cass search` process (--refresh, inline
+    // self-heal) verifies every lexical byte like a standalone `cass index`.
+    let _strict_lexical_opens = crate::search::quill_bridge::strict_lexical_opens();
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
     if let Some(warning) = dotenvy::var("CASS_EXCLUDE_PATHS")
         .ok()

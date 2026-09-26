@@ -31196,6 +31196,9 @@ fn run_cli_search(
 
     // Start timing for robot_meta elapsed_ms
     let start_time = Instant::now();
+    // Searches may skip re-hashing index segments an earlier search already
+    // verified and that are unchanged on disk; other commands never do.
+    crate::search::quill_bridge::enable_search_open_receipts();
 
     let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let index_path = crate::search::tantivy::expected_index_dir(&data_dir);

@@ -1168,7 +1168,7 @@ pub fn open_federated_search_readers(
         .into_iter()
         .map(|shard| {
             let shard_path = index_path.join(&shard.relative_path);
-            crate::search::quill_bridge::open_cass_reader(&shard_path)
+            crate::search::quill_bridge::open_cass_shard_reader(&shard_path)
                 .map(|reader| (reader, cass_field_handles()))
                 .with_context(|| {
                     format!(

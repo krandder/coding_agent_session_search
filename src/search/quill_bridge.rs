@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -45,6 +45,82 @@ pub const QUILL_INDEX_MARKER: &str = "MANIFEST";
 /// unbounded scan, so raising it is a diagnostic/escape hatch, not a tuning
 /// knob; the durable fix for fuel exhaustion is a compacted index (#441).
 pub const CASS_QUILL_QUERY_FUEL_BUDGET_ENV: &str = "CASS_QUILL_QUERY_FUEL_BUDGET";
+
+/// Set to a truthy value (`1`, `true`, `yes`, `on`) to make `cass search`
+/// re-hash every segment byte on every open instead of trusting open receipts.
+/// Every other command already does: only `search` turns receipts on.
+pub const CASS_LEXICAL_VERIFY_EVERY_OPEN_ENV: &str = "CASS_LEXICAL_VERIFY_EVERY_OPEN";
+
+/// Whether lexical reader opens in this process may use open receipts. Only
+/// the `search` command sets it ([`enable_search_open_receipts`]); indexing,
+/// repair, doctor, health and status keep verifying every byte on every open.
+static SEARCH_OPEN_RECEIPTS: AtomicBool = AtomicBool::new(false);
+
+/// Let lexical reader opens in this process use open receipts (see
+/// [`lexical_open_receipt_book`]). Called by the `search` command only.
+pub fn enable_search_open_receipts() {
+    SEARCH_OPEN_RECEIPTS.store(true, Ordering::Relaxed);
+}
+
+/// Live [`StrictLexicalOpens`] guards; receipts are used only while it is 0.
+static STRICT_LEXICAL_OPEN_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+/// While alive, lexical reader opens in this process verify every byte even
+/// in a `search` process. Taken for every index pass, so an in-process
+/// refresh or self-heal rebuild never trusts receipts.
+pub struct StrictLexicalOpens(());
+
+/// Start a [`StrictLexicalOpens`] scope.
+#[must_use]
+pub fn strict_lexical_opens() -> StrictLexicalOpens {
+    STRICT_LEXICAL_OPEN_DEPTH.fetch_add(1, Ordering::SeqCst);
+    StrictLexicalOpens(())
+}
+
+impl Drop for StrictLexicalOpens {
+    fn drop(&mut self) {
+        STRICT_LEXICAL_OPEN_DEPTH.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Quill open-receipt book for the lexical index at `index_path`: a file next
+/// to the index directory (`v9-quill.open-receipts`), never inside it.
+///
+/// With a book, a reader skips the whole-file hash of a segment that an
+/// earlier open fully verified and that is still the same file (device,
+/// inode, length, mtime and ctime). New or changed segments are verified as
+/// before, so a half-written or rewritten generation still fails closed.
+/// `None` (full verification on every open) outside `cass search`, inside an
+/// index pass ([`strict_lexical_opens`]), or when
+/// [`CASS_LEXICAL_VERIFY_EVERY_OPEN_ENV`] is truthy.
+fn lexical_open_receipt_book(index_path: &Path) -> Option<PathBuf> {
+    if !SEARCH_OPEN_RECEIPTS.load(Ordering::Relaxed)
+        || STRICT_LEXICAL_OPEN_DEPTH.load(Ordering::SeqCst) != 0
+    {
+        return None;
+    }
+    receipt_book_for(
+        index_path,
+        dotenvy::var(CASS_LEXICAL_VERIFY_EVERY_OPEN_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn receipt_book_for(index_path: &Path, verify_every_open: Option<&str>) -> Option<PathBuf> {
+    let verify_every_open = verify_every_open.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    });
+    if verify_every_open {
+        return None;
+    }
+    let mut name = index_path.file_name()?.to_os_string();
+    name.push(".open-receipts");
+    Some(index_path.with_file_name(name))
+}
 
 /// Whether `error` is Quill's typed query-fuel refusal (#441), anywhere in
 /// its context chain. The engine reports it as `... query fuel exhausted after
@@ -417,13 +493,29 @@ pub fn content_snippet_generator(
 ///
 /// Returns an error when the published snapshot cannot be opened.
 pub fn open_cass_reader(path: &Path) -> Result<QuillSearchIndex> {
+    open_cass_reader_with(path, lexical_open_receipt_book(path))
+}
+
+/// [`open_cass_reader`] for one shard of a federated bundle. Never uses open
+/// receipts: a shard lives inside the bundle root, whose files are the bundle's
+/// evidence, and a receipt book beside it would change that evidence.
+///
+/// # Errors
+///
+/// Returns an error when the published snapshot cannot be opened.
+pub fn open_cass_shard_reader(path: &Path) -> Result<QuillSearchIndex> {
+    open_cass_reader_with(path, None)
+}
+
+fn open_cass_reader_with(path: &Path, receipt_book: Option<PathBuf>) -> Result<QuillSearchIndex> {
     #[cfg(test)]
     READER_OPEN_COUNT.with(|count| count.set(count.get() + 1));
+    let mut config = cass_quill_config();
+    config.read_open_receipts = receipt_book;
     drive(|cx| {
         let path = path.to_path_buf();
         async move {
-            QuillSearchIndex::open_with_schema(&cx, path, CASS_SEMANTIC_SCHEMA, cass_quill_config())
-                .await
+            QuillSearchIndex::open_with_schema(&cx, path, CASS_SEMANTIC_SCHEMA, config).await
         }
     })
     .map_err(|error| anyhow!("opening Quill CASS reader at {}: {error}", path.display()))
@@ -1929,6 +2021,24 @@ mod tests {
         assert_eq!(
             query_fuel_budget_override(Some("25_000_000")),
             Some(25_000_000)
+        );
+    }
+
+    #[test]
+    fn open_receipt_book_sits_next_to_the_index_and_obeys_the_verify_switch() {
+        let index = Path::new("/data/index/v9-quill");
+        let beside = Some(PathBuf::from("/data/index/v9-quill.open-receipts"));
+        assert_eq!(receipt_book_for(index, None), beside);
+        for keep in ["", "0", "false", "no", "off"] {
+            assert_eq!(receipt_book_for(index, Some(keep)), beside, "{keep:?}");
+        }
+        for verify in ["1", "true", " YES ", "on"] {
+            assert_eq!(receipt_book_for(index, Some(verify)), None, "{verify:?}");
+        }
+        let book = receipt_book_for(index, None).expect("book path");
+        assert!(
+            !book.starts_with(index),
+            "the receipt book must never live inside the index directory"
         );
     }
 
